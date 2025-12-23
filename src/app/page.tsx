@@ -4,8 +4,8 @@ import { useState, useMemo } from 'react';
 import * as XLSX from 'xlsx';
 import { supabase } from '@/lib/supabase';
 import { 
-  Upload, FileSpreadsheet, CheckCircle, AlertTriangle, 
-  Save, Database, ArrowRightLeft, History, Search, Filter, RefreshCw 
+  FileSpreadsheet, CheckCircle, Save, Database, 
+  History, Search, Filter, RefreshCw, AlertTriangle, ArrowRightLeft 
 } from 'lucide-react';
 import Link from 'next/link';
 
@@ -16,46 +16,11 @@ export default function ConferenciaEstoque() {
   const [salvando, setSalvando] = useState(false);
   const [filtros, setFiltros] = useState({ local: '', gtin: '', desc: '', status: '' });
 
-  // Resetar banco de dados (apenas em testes, comentar cod em produção)
-  const resetarBancoDeDados = async () => {
-    const confirmacao = prompt("Digite 'DELETAR' para apagar TODO o histórico e itens do banco.");
-    
-    if (confirmacao !== 'DELETAR') return;
-    
-    setLoading(true);
-    try {
-      // 1. Apaga o histórico de contagens (Tabela Filha)
-      const { error: errCont } = await supabase
-        .from('inventario_contagens')
-        .delete()
-        .neq('id', '00000000-0000-0000-0000-000000000000'); // Delete "tudo que não é ID zero"
-
-      if (errCont) throw errCont;
-
-      // 2. Apaga o cadastro mestre (Tabela Pai)
-      const { error: errItens } = await supabase
-        .from('inventario_itens')
-        .delete()
-        .neq('id', '00000000-0000-0000-0000-000000000000');
-
-      if (errItens) throw errItens;
-
-      alert("Banco de dados resetado com sucesso!");
-      setDadosProcessados([]); // Limpa a tela também
-      setFiles({c1: null, c2: null, sys: null}); // Limpa inputs
-      
-    } catch (error: any) {
-      alert("Erro ao limpar banco: " + error.message);
-    } finally {
-      setLoading(false);
-    }
-  };
-
   // Controle de Modo
   const [modoAuditoria, setModoAuditoria] = useState(false);
   const [rodadaAtual, setRodadaAtual] = useState(3);
 
-  // --- LEITURA DE EXCEL ---
+  // --- HELPER: LEITURA DE EXCEL ---
   const lerExcel = async (file: File) => {
     const data = await file.arrayBuffer();
     const workbook = XLSX.read(data);
@@ -64,6 +29,10 @@ export default function ConferenciaEstoque() {
   };
 
   const norm = (txt: any) => String(txt || '').trim().toUpperCase();
+
+  const getDesc = (row: any) => {
+    return row['Descrição'] || row['Descricao'] || row['Descrição do Produto'] || row['Produto'] || row['Material'] || row['Description'] || '';
+  };
 
   // --- LÓGICA 1: MODO INICIAL (1ª e 2ª) ---
   const processarInicial = async () => {
@@ -78,7 +47,7 @@ export default function ConferenciaEstoque() {
       const mapa = new Map();
       const saldosGlobais = new Map(); 
 
-      // 1. Carrega Sistema
+      // 1. Carrega Sistema (Saldos Globais)
       rawSys.forEach((row: any) => {
         const gtin = norm(row['GTIN'] || row['Codigo']);
         const lote = norm(row['Lote'] || row['Batch']);
@@ -86,8 +55,10 @@ export default function ConferenciaEstoque() {
         const qtd = Number(row['Armazenado'] || row['Qtd_Sistema'] || 0);
         
         const chaveGlobal = `${gtin}|${lote}`;
-        if (!saldosGlobais.has(chaveGlobal)) saldosGlobais.set(chaveGlobal, { sys: 0, fis: 0 });
-        saldosGlobais.get(chaveGlobal).sys += qtd;
+        if (!saldosGlobais.has(chaveGlobal)) saldosGlobais.set(chaveGlobal, { sys: 0, fis: 0, locaisEsperados: new Set() });
+        const global = saldosGlobais.get(chaveGlobal);
+        global.sys += qtd;
+        global.locaisEsperados.add(local);
       });
 
       // 2. Processa Linhas
@@ -99,18 +70,24 @@ export default function ConferenciaEstoque() {
 
         const chave = `${local}|${gtin}|${lote}`;
         const chaveGlobal = `${gtin}|${lote}`;
+        const descricaoItem = getDesc(row);
 
         if (!mapa.has(chave)) {
+           const locaisSys = saldosGlobais.get(chaveGlobal)?.locaisEsperados || new Set();
+           const locaisStr = Array.from(locaisSys).join(', ');
+
            mapa.set(chave, {
-             idTemp: chave, local, gtin, lote, desc: row['Descrição'] || '',
-             qtdSys: 0, qtd1: 0, qtd2: 0, user1: '', user2: '', status: '', acao: '', chaveGlobal
+             idTemp: chave, local, gtin, lote, 
+             desc: descricaoItem, 
+             qtdSys: 0, qtd1: 0, qtd2: 0, user1: '', user2: '', status: '', acao: '', chaveGlobal,
+             locaisSistema: locaisStr
            });
         }
         const item = mapa.get(chave);
+        if (descricaoItem && (!item.desc || item.desc === '')) item.desc = descricaoItem;
         
         if (tipo === 'sys') {
             item.qtdSys += Number(row['Armazenado'] || row['Qtd_Sistema'] || 0);
-            if (row['Descrição']) item.desc = row['Descrição'];
         } else {
             const qtd = Number(row['Quantidade_Contada'] || 0);
             const user = String(row['Usuario'] || '');
@@ -148,13 +125,12 @@ export default function ConferenciaEstoque() {
     finally { setLoading(false); }
   };
 
-  // --- LÓGICA 2: MODO AUDITORIA (Busca do Banco vs Arquivo Auditoria) ---
+  // --- LÓGICA 2: MODO AUDITORIA ---
   const processarAuditoria = async () => {
     if (!files.c1) { alert("Anexe o arquivo da contagem atual."); return; }
     setLoading(true);
     
     try {
-        // 1. Busca no Banco APENAS o que não está OK (as pendências)
         const { data: pendencias, error } = await supabase
             .from('inventario_itens')
             .select('*')
@@ -164,33 +140,28 @@ export default function ConferenciaEstoque() {
         if (error) throw error;
         if (!pendencias || pendencias.length === 0) { alert("Não há itens pendentes de auditoria no banco."); return; }
 
-        // 2. Lê o Arquivo da Auditoria (Auditor)
         const rawAudit = await files.c1 ? await lerExcel(files.c1 as any) : [];
-
-        // 3. Cruza os dados
         const mapa = new Map();
 
-        // Popula com o que o banco ESPERA (snapshot do sistema)
         pendencias.forEach((dbItem: any) => {
             const chave = `${dbItem.localizacao}|${dbItem.gtin}|${dbItem.lote}`;
             mapa.set(chave, {
                 idTemp: chave, dbId: dbItem.id,
                 local: dbItem.localizacao, gtin: dbItem.gtin, lote: dbItem.lote,
-                desc: dbItem.descricao,
-                qtdSys: dbItem.qtd_sistema, // O que o sistema diz
-                qtdAnterior: 0, // Poderíamos buscar o histórico, mas o foco é Sys vs Audit
+                desc: dbItem.descricao, 
+                qtdSys: dbItem.qtd_sistema,
                 qtdAudit: 0, userAudit: '',
                 status: 'PENDENTE', acao: 'Item não contado na auditoria'
             });
         });
 
-        // Popula com o que foi CONTADO
         rawAudit.forEach((row: any) => {
             const local = norm(row['Localização'] || row['Localizacao'] || row['Local']);
             const gtin = norm(row['GTIN'] || row['Codigo']);
             const lote = norm(row['Lote'] || row['Batch']);
             const qtd = Number(row['Quantidade_Contada'] || 0);
             const user = String(row['Usuario'] || '');
+            const descAudit = getDesc(row);
 
             const chave = `${local}|${gtin}|${lote}`;
             
@@ -199,28 +170,22 @@ export default function ConferenciaEstoque() {
                 item.qtdAudit += qtd;
                 item.userAudit = user;
             } else {
-                // Item que o auditor achou mas não estava na lista de pendência (Sobra nova ou erro)
                 mapa.set(chave, {
-                    idTemp: chave, local, gtin, lote, desc: row['Descrição'] || 'Novo Item',
+                    idTemp: chave, local, gtin, lote, 
+                    desc: descAudit || 'Novo Item',
                     qtdSys: 0, qtdAudit: qtd, userAudit: user,
                     status: 'ITEM NAO SOLICITADO', acao: 'Verificar origem'
                 });
             }
         });
 
-        // 4. Define Novo Status (Tira-Teima)
         const resultado = Array.from(mapa.values()).map(item => {
-            // Se não foi contado agora, mantém pendente
             if (item.qtdAudit === 0 && item.status !== 'ITEM NAO SOLICITADO') return item;
-
-            // Lógica de Decisão
             if (item.qtdAudit === item.qtdSys) {
                 return { ...item, status: 'OK', acao: 'Resolvido na Auditoria' };
             } else {
-                // Se continua diferente do sistema
                 const diff = item.qtdAudit - item.qtdSys;
                 const tipo = diff > 0 ? 'SOBRA CONFIRMADA' : 'FALTA CONFIRMADA';
-                // Se estamos na última rodada (ex: 6), sugere ajuste, senão próxima contagem
                 const prox = rodadaAtual < 6 ? `Enviar para ${rodadaAtual + 1}ª Contagem` : 'Ajustar Sistema';
                 return { ...item, status: tipo, acao: prox };
             }
@@ -237,7 +202,6 @@ export default function ConferenciaEstoque() {
     if (!confirm(`Gravar ${modoAuditoria ? 'AUDITORIA' : 'INICIAL'} no histórico?`)) return;
     setSalvando(true);
     try {
-      // 1. Atualiza Status Mestre
       const itensMestre = dadosProcessados.map(d => ({
         localizacao: d.local, gtin: d.gtin, lote: d.lote, descricao: d.desc,
         qtd_sistema: d.qtdSys, status_atual: d.status
@@ -250,7 +214,6 @@ export default function ConferenciaEstoque() {
         
       if (errMestre) throw errMestre;
 
-      // 2. Insere Contagem Histórica
       const idMap = new Map();
       itensSalvos?.forEach((i: any) => idMap.set(`${i.localizacao}|${i.gtin}|${i.lote}`, i.id));
       
@@ -260,15 +223,12 @@ export default function ConferenciaEstoque() {
         if (!dbId) continue;
         
         if (!modoAuditoria) {
-             // Modo Inicial (Rodadas 1 e 2)
-            if (d.qtd1 !== undefined) contagens.push({ item_id: dbId, rodada: 1, quantidade: d.qtd1, usuario: d.user1 });
-            if (d.qtd2 !== undefined) contagens.push({ item_id: dbId, rodada: 2, quantidade: d.qtd2, usuario: d.user2 });
+           if (d.qtd1 !== undefined) contagens.push({ item_id: dbId, rodada: 1, quantidade: d.qtd1, usuario: d.user1 });
+           if (d.qtd2 !== undefined) contagens.push({ item_id: dbId, rodada: 2, quantidade: d.qtd2, usuario: d.user2 });
         } else {
-            // Modo Auditoria (Rodada X)
-            // Só salva se houve contagem nessa rodada
-            if (d.qtdAudit !== undefined && d.qtdAudit !== 0) {
-                contagens.push({ item_id: dbId, rodada: rodadaAtual, quantidade: d.qtdAudit, usuario: d.userAudit });
-            }
+           if (d.qtdAudit !== undefined && d.qtdAudit !== 0) {
+               contagens.push({ item_id: dbId, rodada: rodadaAtual, quantidade: d.qtdAudit, usuario: d.userAudit });
+           }
         }
       }
       
@@ -276,19 +236,39 @@ export default function ConferenciaEstoque() {
           const { error: errCont } = await supabase.from('inventario_contagens').insert(contagens);
           if (errCont) throw errCont;
       }
-
       alert("Dados atualizados com sucesso!");
     } catch (err: any) { alert("Erro ao salvar: " + err.message); } 
     finally { setSalvando(false); }
   };
 
-  // --- EXPORTAÇÃO ---
+  // --- EXPORTAÇÕES ---
   const baixarPlanilha = () => {
-      // Baixa o que está na tela
       const ws = XLSX.utils.json_to_sheet(dadosFiltrados);
       const wb = XLSX.utils.book_new();
       XLSX.utils.book_append_sheet(wb, ws, "Resultado");
       XLSX.writeFile(wb, `Resultado_Rodada_${modoAuditoria ? rodadaAtual : 'Inicial'}.xlsx`);
+  };
+
+  const baixarDivergencias = () => {
+    const data = dadosFiltrados.filter(i => !i.status.includes('OK') && !i.status.includes('ALERTA LOCAL'));
+    const ws = XLSX.utils.json_to_sheet(data);
+    const wb = XLSX.utils.book_new();
+    XLSX.utils.book_append_sheet(wb, ws, "Divergencias");
+    XLSX.writeFile(wb, "Relatorio_Divergencias.xlsx");
+  };
+
+  const baixarTransferencias = () => {
+    const data = dadosFiltrados
+        .filter(i => i.status === 'ALERTA LOCAL')
+        .map(i => ({
+            'Local Físico (Bipado)': i.local, 'GTIN': i.gtin, 'Lote': i.lote,
+            'Descrição': i.desc, 'Qtd Encontrada': modoAuditoria ? i.qtd1 : i.qtd2,
+            'Qtd Sistema Neste Local': i.qtdSys, 'ONDE DEVERIA ESTAR': i.locaisSistema
+        }));
+    const ws = XLSX.utils.json_to_sheet(data);
+    const wb = XLSX.utils.book_new();
+    XLSX.utils.book_append_sheet(wb, ws, "Transferencias");
+    XLSX.writeFile(wb, "Relatorio_Transferencias.xlsx");
   };
 
   // --- FILTROS VISUAIS ---
@@ -299,7 +279,7 @@ export default function ConferenciaEstoque() {
         item.local.includes(filtros.local.toUpperCase()) &&
         (item.gtin.includes(filtros.gtin.toUpperCase()) || item.lote.includes(filtros.gtin.toUpperCase())) &&
         item.desc.toUpperCase().includes(filtros.desc.toUpperCase()) &&
-        String(qVal || '').includes('') && // Placeholder para filtro de qtd
+        String(qVal || '').includes('') && 
         item.status.toUpperCase().includes(filtros.status.toUpperCase())
       );
     });
@@ -319,8 +299,12 @@ export default function ConferenciaEstoque() {
       {/* HEADER */}
       <header className="bg-white border-b shadow-sm z-20 flex flex-col shrink-0">
         <div className="flex justify-between items-center px-6 py-2 border-b border-slate-100">
-            <div className="flex items-center gap-2">
-                <CheckCircle className="text-blue-600 w-6 h-6" />
+            <div className="flex items-center gap-3">
+                <img 
+                    src="/logo.png" 
+                    alt="Logo Empresa" 
+                    className="h-8 w-auto object-contain" 
+                />
                 <h1 className="text-lg font-bold text-slate-900">Conferência de Inventário</h1>
             </div>
             <Link href="/historico" className="text-xs font-semibold text-slate-600 hover:text-blue-600 flex items-center gap-1 bg-slate-50 px-3 py-1.5 rounded-full border">
@@ -379,27 +363,27 @@ export default function ConferenciaEstoque() {
         {dadosProcessados.length > 0 && (
             <div className="flex items-center gap-2 px-6 py-2 bg-slate-100 border-t border-slate-200">
                 <span className="text-xs font-bold text-slate-600 mr-2">Itens: {dadosFiltrados.length}</span>
+                
                 <button onClick={salvarNoSupabase} disabled={salvando} className="h-7 px-3 bg-green-600 text-white rounded text-xs font-bold hover:bg-green-700 flex items-center gap-1 shadow-sm">
-                    <Save size={12}/> {salvando ? 'Salvando...' : 'Gravar Resultado'}
+                    <Save size={14}/> {salvando ? 'Salvando...' : 'Gravar Resultado'}
                 </button>
-                <button onClick={baixarPlanilha} className="h-7 px-3 bg-amber-600 text-white rounded text-xs font-bold hover:bg-amber-700 flex items-center gap-1 shadow-sm">
-                    <FileSpreadsheet size={12}/> Download Excel
+                
+                <div className="h-4 w-px bg-slate-300 mx-1"></div>
+
+                <button onClick={baixarDivergencias} className="h-7 px-3 bg-amber-600 text-white rounded text-xs font-bold hover:bg-amber-700 flex items-center gap-1 shadow-sm">
+                    <AlertTriangle size={14}/> Baixar Divergências
+                </button>
+
+                <button onClick={baixarTransferencias} className="h-7 px-3 bg-purple-600 text-white rounded text-xs font-bold hover:bg-purple-700 flex items-center gap-1 shadow-sm">
+                    <ArrowRightLeft size={14}/> Baixar Transferências
+                </button>
+
+                <button onClick={baixarPlanilha} className="h-7 px-3 bg-slate-600 text-white rounded text-xs font-bold hover:bg-slate-700 flex items-center gap-1 shadow-sm ml-auto">
+                    <FileSpreadsheet size={14}/> Geral
                 </button>
             </div>
-
-            
-
         )}
       </header>
-
-      <div className="mt-10 border-t pt-4 text-center">
-      <button 
-        onClick={resetarBancoDeDados} 
-        className="text-xs text-red-500 hover:text-red-700 font-bold underline"
-      >
-        (Zona de Perigo) Resetar Todo o Banco de Dados
-      </button>
-      </div>
 
       {/* TABELA */}
       <main className="flex-1 overflow-auto p-0 bg-white relative w-full">
@@ -435,25 +419,57 @@ export default function ConferenciaEstoque() {
             </thead>
             <tbody className="divide-y divide-slate-100">
               {dadosFiltrados.map((item) => (
-                <tr key={item.idTemp} className={`text-xs ${item.status === 'OK' ? 'hover:bg-slate-50' : 'bg-red-50 hover:bg-red-100'}`}>
+                <tr key={item.idTemp} className={`text-xs transition-colors ${
+                    item.status === 'OK' ? 'hover:bg-slate-50' : 
+                    item.status === 'ALERTA LOCAL' ? 'bg-yellow-50 hover:bg-yellow-100' : 
+                    'bg-red-50 hover:bg-red-100'
+                }`}>
                   <td className="px-4 py-3 font-medium">{item.local}</td>
+                  
                   <td className="px-4 py-3">
                     <div className="font-bold">{item.gtin}</div>
                     <div className="text-[10px] text-slate-500">{item.lote}</div>
                   </td>
-                  <td className="px-4 py-3 truncate max-w-[300px]" title={item.desc}>{item.desc}</td>
+                  
+                  <td className="px-4 py-3 truncate max-w-[300px]" title={item.desc}>
+                    {item.desc}
+                  </td>
                   
                   {modoAuditoria ? (
-                     <td className="px-2 py-3 text-center font-bold text-purple-700 bg-purple-50/30">{item.qtdAudit}</td>
+                    <td className="px-2 py-3 text-center font-bold text-purple-700 bg-purple-50/30">
+                        {item.qtdAudit}
+                    </td>
                   ) : (
-                     <>
-                        <td className="px-2 py-3 text-center font-bold text-blue-700 bg-blue-50/30">{item.qtd1}</td>
-                        <td className="px-2 py-3 text-center font-bold text-indigo-700 bg-indigo-50/30">{item.qtd2}</td>
-                     </>
+                    <>
+                        <td className="px-2 py-3 text-center font-bold text-blue-700 bg-blue-50/30">
+                            {item.qtd1}
+                        </td>
+                        <td className="px-2 py-3 text-center font-bold text-indigo-700 bg-indigo-50/30">
+                            {item.qtd2}
+                        </td>
+                    </>
                   )}
                   
-                  <td className="px-2 py-3 text-center font-bold text-green-700 bg-green-50/30">{item.qtdSys}</td>
-                  <td className="px-4 py-3 font-bold">{item.status}</td>
+                  <td className="px-2 py-3 text-center font-bold text-green-700 bg-green-50/30">
+                    {item.qtdSys}
+                  </td>
+                  
+                  <td className="px-4 py-3">
+                    <span className={`flex items-center w-fit px-2 py-0.5 rounded text-[10px] font-bold border whitespace-nowrap ${
+                        item.status === 'ALERTA LOCAL' ? 'text-yellow-700 bg-yellow-100 border-yellow-200' : 
+                        item.status === 'OK' ? 'text-green-700 bg-green-100 border-green-200' : 
+                        'text-red-700 bg-red-100 border-red-200'
+                    }`}>
+                        {item.status === 'OK' ? (
+                            <CheckCircle size={12} className="mr-1" />
+                        ) : item.status === 'ALERTA LOCAL' ? (
+                            <ArrowRightLeft size={12} className="mr-1" />
+                        ) : (
+                            <AlertTriangle size={12} className="mr-1" />
+                        )}
+                        {item.status}
+                    </span>
+                  </td>
                 </tr>
               ))}
             </tbody>
